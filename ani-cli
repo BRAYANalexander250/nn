@@ -1,6 +1,12 @@
 #!/bin/sh
 
-version_number="4.7.3"
+version_number="4.8.0"
+
+# TODO: implement caching => @Derisis13 :point_right: :point_left:
+cleanup() {
+    rm "$HOME"/.cache/ani-cli/images/* >/dev/null 2>&1
+}
+trap cleanup EXIT INT TERM
 
 # UI
 
@@ -133,6 +139,25 @@ get_links() {
     [ -z "$ANI_CLI_NON_INTERACTIVE" ] && printf "\033[1;32m%s\033[0m Links Fetched\n" "$provider_name" 1>&2
 }
 
+download_thumbnails() {
+    [ -d "$HOME/.cache/ani-cli/images" ] || mkdir -p "$HOME/.cache/ani-cli/images"
+    printf "\33[2K\r\033[1;34mDownloading thumbnails...\033\n[0m"
+    printf "%s\n" "$1" | while read -r cover_url anime_id anime_title; do
+        curl -s -o "$HOME/.cache/ani-cli/images/$anime_title  $anime_id.jpg" "$cover_url" &&
+            convert "$HOME/.cache/ani-cli/images/$anime_title  $anime_id.jpg" -resize "${thumbnail_size}x${thumbnail_size}" "$HOME/.cache/ani-cli/images/$anime_title  $anime_id.jpg" &
+    done
+    sleep "$2"
+}
+
+image_preview() {
+    if [ "$use_external_menu" = "0" ]; then
+        choice=$(find ~/.cache/ani-cli/images/ -type f -exec basename {} \; | fzf --cycle --reverse --with-nth 1 -d '  ' --preview="chafa ~/.cache/ani-cli/images/{}")
+    else
+        choice=$(find ~/.cache/ani-cli/images/ -type f -exec basename {} \; | while read A; do printf "%s\x00icon\x1f%s\n" "$A" "~/.cache/ani-cli/images/$A"; done | rofi -dmenu -p "" -display-columns 1 -display-column-separator '  ')
+    fi
+    [ -z "$choice" ] && exit 1
+}
+
 # innitialises provider_name and provider_id. First argument is the provider name, 2nd is the regex that matches that provider's link
 provider_init() {
     provider_name=$1
@@ -196,9 +221,15 @@ get_episode_url() {
 
 # search the query and give results
 search_anime() {
-    search_gql="query(        \$search: SearchInput        \$limit: Int        \$page: Int        \$translationType: VaildTranslationTypeEnumType        \$countryOrigin: VaildCountryOriginEnumType    ) {    shows(        search: \$search        limit: \$limit        page: \$page        translationType: \$translationType        countryOrigin: \$countryOrigin    ) {        edges {            _id name availableEpisodes __typename       }    }}"
+    search_gql="query(        \$search: SearchInput        \$limit: Int        \$page: Int        \$translationType: VaildTranslationTypeEnumType        \$countryOrigin: VaildCountryOriginEnumType    ) {    shows(        search: \$search        limit: \$limit        page: \$page        translationType: \$translationType        countryOrigin: \$countryOrigin    ) {        edges {            _id name availableEpisodes thumbnail __typename}    }}"
 
-    curl -e "$allanime_base" -s -G "${allanime_api}/api" --data-urlencode "variables={\"search\":{\"allowAdult\":false,\"allowUnknown\":false,\"query\":\"$1\"},\"limit\":40,\"page\":1,\"translationType\":\"$mode\",\"countryOrigin\":\"ALL\"}" --data-urlencode "query=$search_gql" -A "$agent" | sed 's|Show|\n|g' | sed -nE "s|.*_id\":\"([^\"]*)\",\"name\":\"([^\"]*)\".*${mode}\":([1-9][^,]*).*|\1\t\2 (\3 episodes)|p"
+    if [ "$thumbnails" = "1" ]; then
+        images=$(curl -e "$allanime_base" -s --cipher "AES256-SHA256" -G "${allanime_api}/api" --data-urlencode "variables={\"search\":{\"allowAdult\":false,\"allowUnknown\":false,\"query\":\"$1\"},\"limit\":40,\"page\":1,\"translationType\":\"$mode\",\"countryOrigin\":\"ALL\"}" --data-urlencode "query=$search_gql" -A "$agent" |
+            sed 's|Show|\n|g' | sed -nE "s|.*_id\":\"([^\"]*)\",\"name\":\"([^\"]*)\".*${mode}\":([1-9][^,]*).*\"thumbnail\":\"([^\"]*)\".*|\4\t\1\t\2 (\3 episodes)|p")
+        download_thumbnails "$images" 1
+    else
+        curl -e "$allanime_base" -s --cipher "AES256-SHA256" -G "${allanime_api}/api" --data-urlencode "variables={\"search\":{\"allowAdult\":false,\"allowUnknown\":false,\"query\":\"$1\"},\"limit\":40,\"page\":1,\"translationType\":\"$mode\",\"countryOrigin\":\"ALL\"}" --data-urlencode "query=$search_gql" -A "$agent" | sed 's|Show|\n|g' | sed -nE "s|.*_id\":\"([^\"]*)\",\"name\":\"([^\"]*)\".*${mode}\":([1-9][^,]*).*|\1\t\2 (\3 episodes)|p"
+    fi
 }
 
 # get the episodes list of the selected anime
@@ -326,6 +357,9 @@ histfile="$hist_dir/ani-hsts"
 [ ! -f "$histfile" ] && : >"$histfile"
 search="${ANI_CLI_DEFAULT_SOURCE:-scrape}"
 
+thumbnails="${ANI_CLI_THUMBNAILS:-0}"
+thumbnail_size="${ANI_CLI_THUMBNAIL_SIZE:-1000}"
+
 while [ $# -gt 0 ]; do
     case "$1" in
         -v | --vlc)
@@ -370,6 +404,7 @@ while [ $# -gt 0 ]; do
             [ -n "$index" ] && ANI_CLI_NON_INTERACTIVE=1 #Checks for -S presence
             shift
             ;;
+        -t | --thumbnail) thumbnails=1 ;;
         --dub) mode="dub" ;;
         --rofi) use_external_menu=1 ;;
         --skip) skip_intro=1 ;;
@@ -426,14 +461,21 @@ case "$search" in
             [ -z "$query" ] && exit 1
         fi
         query=$(printf "%s" "$query" | sed "s| |+|g")
-        anime_list=$(search_anime "$query")
-        [ -z "$anime_list" ] && die "No results found!"
-        [ "$index" -eq "$index" ] 2>/dev/null && result=$(printf "%s" "$anime_list" | sed -n "${index}p")
-        [ -z "$index" ] && result=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: ")
-        [ -z "$result" ] && exit 1
-        title=$(printf "%s" "$result" | cut -f2)
+        if [ "$thumbnails" = "1" ]; then
+            search_anime "$query"
+            image_preview
+            title=$(printf "%s" "$choice" | sed -nE "s/(.*) \([0-9]* episodes\)  .*/\1 /p")
+            id=$(printf "%s" "$choice" | sed -nE "s/.* \([0-9]* episodes\)  (.*)\.jpg/\1/p")
+        else
+            anime_list=$(search_anime "$query")
+            [ -z "$anime_list" ] && die "No results found!"
+            [ "$index" -eq "$index" ] 2>/dev/null && result=$(printf "%s" "$anime_list" | sed -n "${index}p")
+            [ -z "$index" ] && result=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: ")
+            [ -z "$result" ] && exit 1
+            title=$(printf "%s" "$result" | cut -f2)
+            id=$(printf "%s" "$result" | cut -f1)
+        fi
         allanime_title="$(printf "%s" "$title" | cut -d'(' -f1 | tr -d '[:punct:]')"
-        id=$(printf "%s" "$result" | cut -f1)
         ep_list=$(episodes_list "$id")
         [ -z "$ep_no" ] && ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$multi_selection_flag")
         [ -z "$ep_no" ] && exit 1
